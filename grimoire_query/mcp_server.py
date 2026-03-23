@@ -7,16 +7,14 @@ mcp = FastMCP("grimoire-query")
 
 
 def _get_cache_path() -> str:
-    config_path = os.environ.get("GRIMOIRE_CONFIG", "config.toml")
-    if not os.path.isabs(config_path):
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        config_path = os.path.join(project_root, config_path)
     import tomllib
-
+    config_path = os.environ.get("GRIMOIRE_CONFIG", "config.toml")
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
-    project_root = config["project"]["root"]
-    return os.path.join(project_root, "Saved", "Grimoire", "cache.db")
+    root = config["project"]["root"]
+    # Normalize ALL possible path separators
+    root = root.replace("\\\\", "/").replace("\\", "/").rstrip("/")
+    return root + "/Saved/Grimoire/cache.db"
 
 
 def _query(sql: str, params: tuple = ()) -> list:

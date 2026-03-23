@@ -1,0 +1,15 @@
+[project]
+name = "Grimoire"
+root = "C:/Users/alexs/Desktop/grimoire-ue5"
+
+[ipc]
+host = "127.0.0.1"
+port = 65432
+timeout_sec = 5
+
+[server]
+log_level = "info"
+
+[events]
+index_engine = false
+autoscan_interval = 15

@@ -103,6 +103,38 @@ def asset_search(
     return _call("asset_search", {"asset_class": asset_class, "name_filter": name_filter})
 
 
+@mcp.tool()
+def query_cache(
+    tool: str,
+    parent_class: str | None = None,
+    has_function: str | None = None,
+    has_variable: str | None = None,
+    references_type: str | None = None,
+    name_filter: str | None = None,
+    input_type: str | None = None,
+    output_type: str | None = None,
+    type_name: str | None = None,
+) -> str:
+    """Query the Grimoire SQLite cache. Set tool to 'query_blueprints', 'query_functions', or 'query_references'. query_blueprints: filter by parent_class, has_function, has_variable, references_type. query_functions: filter by name_filter, input_type, output_type. query_references: requires type_name."""
+    if tool == "query_blueprints":
+        return _call("query_blueprints", {
+            "parent_class": parent_class,
+            "has_function": has_function,
+            "has_variable": has_variable,
+            "references_type": references_type,
+        })
+    elif tool == "query_functions":
+        return _call("query_functions", {
+            "name_filter": name_filter,
+            "input_type": input_type,
+            "output_type": output_type,
+        })
+    elif tool == "query_references":
+        return _call("query_references", {"type_name": type_name})
+    else:
+        return '{"error": true, "message": "tool must be query_blueprints, query_functions, or query_references"}'
+
+
 def _debug_schema():
     import json
     for tool in mcp._tool_manager.list_tools():
