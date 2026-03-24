@@ -4,11 +4,18 @@ Handler functions for MCP tools. All handlers run on the Unreal game thread.
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 import unreal
 
 _cache_db_path = None
+_GUID_SUFFIX = re.compile(r'_\d+_[A-F0-9]{32}$')
+
+
+def _clean_name(name: str) -> str:
+    """Strip UE5 internal GUID suffixes from variable and node names."""
+    return _GUID_SUFFIX.sub('', name)
 
 
 def _get_cache_db():
@@ -429,22 +436,22 @@ def _summarize_graph(nodes):
                     else source
                 )
                 steps.append(
-                    f"return {inp['name']} ({inp['type']}) <- {source_ref or '?'}"
+                    f"return {_clean_name(inp['name'])} ({inp['type']}) <- {_clean_name(source_ref) if source_ref else '?'}"
                 )
         elif ntype == "K2Node_VariableGet":
-            steps.append(f"get {ref}")
+            steps.append(f"get {_clean_name(ref) if ref else ''}")
         elif ntype == "K2Node_VariableSet":
-            steps.append(f"set {ref}")
+            steps.append(f"set {_clean_name(ref) if ref else ''}")
         elif ntype == "K2Node_IfThenElse":
             steps.append("branch")
         elif ntype == "K2Node_CallFunction":
-            steps.append(f"call {ref}")
+            steps.append(f"call {_clean_name(ref) if ref else ''}")
         elif ntype == "K2Node_MakeStruct":
-            steps.append(f"make {ref or 'struct'}")
+            steps.append(f"make {_clean_name(ref) if ref else 'struct'}")
         elif ntype == "K2Node_BreakStruct":
-            steps.append(f"break {ref or 'struct'}")
+            steps.append(f"break {_clean_name(ref) if ref else 'struct'}")
         else:
-            steps.append(f"{ntype.replace('K2Node_', '').lower()} {ref or ''}")
+            steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
             if pin["type"] == "exec" and pin["direction"] == "EGPD_Output" and pin["linked_to"]:
                 for target in pin["linked_to"]:
@@ -613,20 +620,18 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                     "TriggeredTime",
                     "ElapsedTime",
                 }
-                GUID_SUFFIX = re.compile(r"_[A-F0-9]{32}$")
-
                 def walk(obj, found):
                     if isinstance(obj, list):
                         for i, item in enumerate(obj):
                             if isinstance(item, str) and item in PROP_TYPES:
                                 if i + 1 < len(obj) and isinstance(obj[i + 1], str):
                                     var_name = obj[i + 1]
+                                    clean_var_name = _clean_name(var_name)
                                     if (
-                                        not any(var_name.startswith(p) for p in EXCLUDE_PREFIXES)
-                                        and var_name not in EXCLUDE_EXACT
-                                        and not GUID_SUFFIX.search(var_name)
+                                        not any(clean_var_name.startswith(p) for p in EXCLUDE_PREFIXES)
+                                        and clean_var_name not in EXCLUDE_EXACT
                                     ):
-                                        found.add((var_name, item))
+                                        found.add((clean_var_name, item))
                             elif isinstance(item, (dict, list)):
                                 walk(item, found)
                     elif isinstance(obj, dict):
@@ -706,7 +711,7 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                                 if pin_name in EXCLUDE_INPUT_NAMES:
                                     continue
                                 type_str = pin_subtype if pin_subtype else pin_cat
-                                inputs.append({"name": pin_name, "type": type_str})
+                                inputs.append({"name": _clean_name(pin_name), "type": type_str})
                             if inputs or "UserDefinedPin" in echunk:
                                 break
                     except Exception:
@@ -731,7 +736,7 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                     for pin_name, cat in pins:
                         if pin_name in ("execute", "then", "self"):
                             continue
-                        outputs.append({"name": pin_name, "type": cat})
+                        outputs.append({"name": _clean_name(pin_name), "type": cat})
 
                     graph_nodes = _parse_function_graph(t3d, graph)
                     body = _summarize_graph(graph_nodes)

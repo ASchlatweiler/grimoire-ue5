@@ -48,15 +48,6 @@ SERVERS = {
             "PYTHONPATH": PROJECT_ROOT_NORM,
         },
     },
-    "grimoire-query": {
-        "command": "python",
-        "args": ["-m", "grimoire_query.mcp_server"],
-        "cwd": PROJECT_ROOT_NORM,
-        "env": {
-            "GRIMOIRE_CONFIG": CONFIG_TOML_NORM,
-            "PYTHONPATH": PROJECT_ROOT_NORM,
-        },
-    },
 }
 
 
@@ -80,6 +71,7 @@ def run():
         config["mcpServers"].pop("grimoire-blueprint", None)
         config["mcpServers"].pop("grimoire-blueprint-b", None)
         config["mcpServers"].pop("grimoire-blueprint-c", None)
+        config["mcpServers"].pop("grimoire-query", None)
 
         for name, server_config in SERVERS.items():
             config["mcpServers"][name] = server_config
