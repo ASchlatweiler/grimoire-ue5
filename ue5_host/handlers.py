@@ -18,6 +18,14 @@ def _clean_name(name: str) -> str:
     return _GUID_SUFFIX.sub('', name)
 
 
+def _extract_class_variable_names(t3d: str) -> set:
+    """Extract authoritative class-level variable names from T3D NewVariables section."""
+    names: set[str] = set()
+    for m in re.finditer(r'NewVariables\(\d+\)=\(VarName="([^"]+)"', t3d):
+        names.add(_clean_name(m.group(1)))
+    return names
+
+
 def _get_cache_db():
     global _cache_db_path
     if _cache_db_path is None:
@@ -666,6 +674,13 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                 with open(t3d_path, "r") as f:
                     t3d = f.read()
 
+                class_vars = _extract_class_variable_names(t3d)
+                for v in variables:
+                    if class_vars:
+                        v["scope"] = "component" if v["name"] in class_vars else "local"
+                    else:
+                        v["scope"] = "component"
+
                 all_graphs = _re.findall(
                     r'Begin Object Class=/Script/Engine\.EdGraph Name="([^"]+)"',
                     t3d,
@@ -743,6 +758,10 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                     functions.append({"name": graph, "inputs": inputs, "outputs": outputs, "body": body})
         except Exception as e:
             warnings.append({"code": "PARTIAL_PARSE", "message": str(e), "section": "functions"})
+
+        for v in variables:
+            if "scope" not in v:
+                v["scope"] = "component"
 
         # Interfaces
         interfaces = []
