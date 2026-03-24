@@ -452,11 +452,53 @@ def _parse_function_graph(t3d, graph_name):
                 "direction": dir_m.group(1) if dir_m else "EGPD_Input",
                 "linked_to": linked_nodes,
             })
-        nodes[node_name] = {"type": node_type, "ref": ref, "pins": pins}
+        node_data: dict = {"type": node_type, "ref": ref, "pins": pins}
+        if node_type == "K2Node_Select":
+            idx_m = re.search(r'IndexPinType=\(PinCategory="([^"]+)"', chunk)
+            node_data["select_index_type"] = idx_m.group(1) if idx_m else None
+            option_pairs = re.findall(
+                r'PinName="(Option \d+)"[^)]*?PinFriendlyName=NSLOCTEXT\s*\(\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"\s*\)',
+                chunk,
+            )
+            if option_pairs:
+                node_data["select_options"] = sorted(
+                    option_pairs,
+                    key=lambda t: int(t[0].split()[1]),
+                )
+        nodes[node_name] = node_data
     return nodes
 
 
-def _summarize_graph(nodes):
+def _clean_body(body: list[str]) -> list[str]:
+    """Remove noise entries and clean up body step strings."""
+    cleaned = []
+    for step in body:
+        # Drop pure execution wire returns — no semantic content
+        if step.startswith("return exec (exec)"):
+            continue
+        # Drop unresolved condition returns — no info
+        if step == "return Condition (bool) <- ?":
+            continue
+        # Drop internal NewEnumerator noise
+        if "NewEnumerator" in step and "<- ?" in step:
+            continue
+        # Trim trailing spaces from node type names
+        step = step.strip()
+        # Clean up empty-name nodes
+        if step in ("calldelegate", "dynamiccast", "setfieldsinstruct",
+                    "mapforeach", "switchenum", "macroinstance"):
+            cleaned.append(step)
+            continue
+        # Collapse callarrayfunction verbosity
+        if step.startswith("callarrayfunction "):
+            op = step.replace("callarrayfunction ", "").strip()
+            cleaned.append(f"array.{op.lower()}")
+            continue
+        cleaned.append(step)
+    return cleaned
+
+
+def _summarize_graph(nodes, t3d: str | None = None, graph_name: str | None = None):
     by_name = {n: d for n, d in nodes.items()}
     entry = next(
         (n for n, d in by_name.items() if d["type"] == "K2Node_FunctionEntry"),
@@ -512,6 +554,14 @@ def _summarize_graph(nodes):
             steps.append(f"make {_clean_name(ref) if ref else 'struct'}")
         elif ntype == "K2Node_BreakStruct":
             steps.append(f"break {_clean_name(ref) if ref else 'struct'}")
+        elif ntype == "K2Node_Select":
+            idx_type = node.get("select_index_type") or "?"
+            options = node.get("select_options") or []
+            if options:
+                opts_str = ", ".join(f"{name}: {fname}" for name, fname in options)
+                steps.append(f"select ({idx_type}) [{opts_str}]")
+            else:
+                steps.append(f"select ({idx_type})")
         else:
             steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
@@ -520,7 +570,31 @@ def _summarize_graph(nodes):
                     walk(target)
 
     walk(entry)
-    return steps
+
+    if t3d and graph_name:
+        select_pattern = rf'K2Node_Select_\d+" ExportPath="[^"]*:{re.escape(graph_name)}\.'
+        for sm in re.finditer(select_pattern, t3d):
+            spos = sm.start()
+            schunk = t3d[spos : spos + 2000]
+            if "CustomProperties" not in schunk[:600]:
+                continue
+            idx_match = re.search(r'IndexPinType=\(PinCategory="([^"]+)"', schunk)
+            idx_type = idx_match.group(1) if idx_match else "?"
+            options = []
+            for opt_m in re.finditer(
+                r'PinName="(Option \d+)",PinFriendlyName=NSLOCTEXT\("[^"]*",\s*"[^"]*",\s*"([^"]*)"\)',
+                schunk,
+            ):
+                options.append((opt_m.group(1), opt_m.group(2)))
+            options.sort(key=lambda x: int(x[0].split()[1]))
+            if options:
+                opts_str = ", ".join(fname for _, fname in options)
+                steps.append(f"select ({idx_type}) [{opts_str}]")
+            else:
+                steps.append(f"select ({idx_type})")
+
+    body = _clean_body(steps)
+    return body
 
 
 def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool = False) -> dict:
@@ -791,7 +865,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                     positions = [m.start() for m in _re.finditer(pattern, t3d)]
                     if not positions:
                         graph_nodes = _parse_function_graph(t3d, graph)
-                        body = _summarize_graph(graph_nodes)
+                        body = _summarize_graph(graph_nodes, t3d, graph)
                         functions.append({"name": graph, "inputs": inputs, "outputs": [], "body": body})
                         continue
 
@@ -828,7 +902,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                             })
 
                     graph_nodes = _parse_function_graph(t3d, graph)
-                    body = _summarize_graph(graph_nodes)
+                    body = _summarize_graph(graph_nodes, t3d, graph)
                     functions.append({"name": graph, "inputs": inputs, "outputs": outputs, "body": body})
 
             class_vars = class_vars_t3d | _collect_bpgc_hierarchy_variable_names(gen_class)

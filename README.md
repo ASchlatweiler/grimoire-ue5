@@ -116,11 +116,11 @@ These pathways require the **Json Blueprint Utilities** plugin to be enabled in 
 
 ### V5 Roadmap
 
-- **Select node resolution** — `K2Node_Select` body display for null-safe and conditional return patterns
-- **Interface implementation scan** — `find_event_bindings` full implementation via T3D parsing
-- **Interface function signatures** — `get_interface` function pin data
-- **EventGraph events** — expose bound events and dispatchers from the ubergraph
-- **SQLite caching** — persistent T3D cache to avoid re-export on every call
+- **Select node resolution** — K2Node_Select body display
+- **Interface implementation scan** — find_event_bindings via T3D
+- **Interface function signatures** — get_interface pin data  
+- **EventGraph events** — bound events and dispatchers
+- ~~SQLite caching~~ ✅ — done in V4.1
 
 ## Switching Projects
 
