@@ -57,7 +57,10 @@ def _run_handler(tool: str, params: dict) -> dict:
     if tool == "get_variables":
         from ue5_host.handlers import handle_get_variables
 
-        return handle_get_variables(blueprint_name=params.get("blueprint_name", ""))
+        return handle_get_variables(
+            blueprint_name=params.get("blueprint_name", ""),
+            include_locals=params.get("include_locals", False),
+        )
     if tool == "list_interfaces":
         from ue5_host.handlers import handle_list_interfaces
 

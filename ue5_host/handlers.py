@@ -26,6 +26,57 @@ def _extract_class_variable_names(t3d: str) -> set:
     return names
 
 
+def _resolve_pin_type(pin_category: str, pin_subcat_object: str) -> str:
+    """Resolve a pin's display type from category and subcat object path."""
+    if pin_subcat_object:
+        m = re.search(r'[./]([A-Za-z_][A-Za-z0-9_]+)\'?"?\s*$', pin_subcat_object)
+        if m:
+            resolved = _clean_name(m.group(1))
+            if resolved:
+                return resolved
+    out = pin_category if pin_category else "unknown"
+    return out if out else "unknown"
+
+
+def _collect_bpgc_hierarchy_variable_names(gen_class) -> set:
+    """VarNames from new_variables on this Blueprint and each BlueprintGeneratedClass parent.
+
+    T3D NewVariables often lists only variables introduced on that asset; inherited Blueprint
+    members are missing and were incorrectly tagged local and filtered out.
+    """
+    names: set[str] = set()
+    if not gen_class:
+        return names
+    g = gen_class
+    for _ in range(64):
+        bp_asset = None
+        try:
+            bp_asset = g.get_editor_property("class_generated_by")
+        except Exception:
+            pass
+        if bp_asset:
+            nvars = None
+            try:
+                nvars = bp_asset.get_editor_property("new_variables")
+            except Exception:
+                pass
+            if nvars:
+                for vd in nvars:
+                    try:
+                        vn = vd.get_editor_property("var_name")
+                        if vn:
+                            names.add(_clean_name(str(vn)))
+                    except Exception:
+                        pass
+        try:
+            g = g.get_super_class()
+        except Exception:
+            break
+        if not g:
+            break
+    return names
+
+
 def _get_cache_db():
     global _cache_db_path
     if _cache_db_path is None:
@@ -383,6 +434,7 @@ def _parse_function_graph(t3d, graph_name):
             pin_chunk = chunk[start:end]
             name_m = re.search(r'PinName="([^"]+)"', pin_chunk)
             cat_m = re.search(r'PinType\.PinCategory="([^"]+)"', pin_chunk)
+            subcat_m = re.search(r'PinType\.PinSubCategoryObject="([^"]*)"', pin_chunk)
             dir_m = re.search(r'Direction="([^"]+)"', pin_chunk)
             linked_m = re.search(r'LinkedTo=\(([^)]+)\)', pin_chunk)
             if not name_m:
@@ -392,9 +444,11 @@ def _parse_function_graph(t3d, graph_name):
                 if linked_m
                 else []
             )
+            cat = cat_m.group(1) if cat_m else "unknown"
+            subcat = subcat_m.group(1) if subcat_m else ""
             pins.append({
                 "name": name_m.group(1),
-                "type": cat_m.group(1) if cat_m else "unknown",
+                "type": _resolve_pin_type(cat, subcat) if cat_m else "unknown",
                 "direction": dir_m.group(1) if dir_m else "EGPD_Input",
                 "linked_to": linked_nodes,
             })
@@ -469,8 +523,12 @@ def _summarize_graph(nodes):
     return steps
 
 
-def handle_get_blueprint(blueprint_name: str) -> dict:
-    """Full inspection of a Blueprint: components, variables, functions, interfaces."""
+def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool = False) -> dict:
+    """Full inspection of a Blueprint: components, variables, functions, interfaces.
+
+    When include_local_variables is True, skips cache read/write and returns all variables
+    (component + local) after stripping scope. Default False: component variables only, cached.
+    """
     try:
         path = blueprint_name if blueprint_name.startswith("/Game") else _find_blueprint_path(blueprint_name)
         if not path:
@@ -481,10 +539,11 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                 "message": f"Blueprint not found: {blueprint_name}",
                 "tool": "get_blueprint",
             }
-        # Check cache first
-        cached = _cache_get(path)
-        if cached is not None:
-            return cached
+        # Check cache first (component-scoped variables only are stored)
+        if not include_local_variables:
+            cached = _cache_get(path)
+            if cached is not None:
+                return cached
         asset = unreal.EditorAssetLibrary.load_asset(path)
         if not asset:
             return {
@@ -670,16 +729,12 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
             task.automated = True
             unreal.Exporter.run_asset_export_task(task)
 
+            class_vars_t3d: set[str] = set()
             if os.path.exists(t3d_path):
                 with open(t3d_path, "r") as f:
                     t3d = f.read()
 
-                class_vars = _extract_class_variable_names(t3d)
-                for v in variables:
-                    if class_vars:
-                        v["scope"] = "component" if v["name"] in class_vars else "local"
-                    else:
-                        v["scope"] = "component"
+                class_vars_t3d = _extract_class_variable_names(t3d)
 
                 all_graphs = _re.findall(
                     r'Begin Object Class=/Script/Engine\.EdGraph Name="([^"]+)"',
@@ -718,14 +773,14 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
                                 echunk = echunk[: next_boundaries[1]]
                             # UserDefinedPin EGPD_Output on FunctionEntry = function input parameter
                             input_pins = _re.findall(
-                                r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="[^"]*\.([^\'".]+)\'?")?[^)]*\),DesiredPinDirection=EGPD_Output',
+                                r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Output',
                                 echunk,
                             )
                             EXCLUDE_INPUT_NAMES = {"Object", "self", "execute", "then", "ReturnValue"}
-                            for pin_name, pin_cat, pin_subtype in input_pins:
+                            for pin_name, pin_cat, pin_subcat in input_pins:
                                 if pin_name in EXCLUDE_INPUT_NAMES:
                                     continue
-                                type_str = pin_subtype if pin_subtype else pin_cat
+                                type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
                                 inputs.append({"name": _clean_name(pin_name), "type": type_str})
                             if inputs or "UserDefinedPin" in echunk:
                                 break
@@ -734,34 +789,65 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
 
                     pattern = rf"K2Node_FunctionResult[^\n]*{_re.escape(name)}:{_re.escape(graph)}\."
                     positions = [m.start() for m in _re.finditer(pattern, t3d)]
-                    if len(positions) < 2:
+                    if not positions:
                         graph_nodes = _parse_function_graph(t3d, graph)
                         body = _summarize_graph(graph_nodes)
                         functions.append({"name": graph, "inputs": inputs, "outputs": [], "body": body})
                         continue
 
-                    chunk = t3d[positions[-1] : positions[-1] + 2000]
-                    pins = _re.findall(
-                        r'PinName="([^"]+)".*?PinType\.PinCategory="([^"]+)"',
+                    rpos = positions[-1]
+                    chunk = t3d[rpos : rpos + 4000]
+                    next_boundaries = [
+                        m.start() for m in _re.finditer(r'K2Node_\w+_\d+" ExportPath=', chunk)
+                    ]
+                    if len(next_boundaries) > 1:
+                        chunk = chunk[: next_boundaries[1]]
+                    # UserDefinedPin EGPD_Input on FunctionResult = function output parameter
+                    output_pins = _re.findall(
+                        r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Input',
                         chunk,
-                        _re.DOTALL,
                     )
-
                     outputs = []
-                    for pin_name, cat in pins:
+                    for pin_name, pin_cat, pin_subcat in output_pins:
                         if pin_name in ("execute", "then", "self"):
                             continue
-                        outputs.append({"name": _clean_name(pin_name), "type": cat})
+                        type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
+                        outputs.append({"name": _clean_name(pin_name), "type": type_str})
+                    if not outputs:
+                        pins = _re.findall(
+                            r'PinName="([^"]+)".*?PinType\.PinCategory="([^"]+)"(?:.*?PinType\.PinSubCategoryObject="([^"]*)")?',
+                            chunk,
+                            _re.DOTALL,
+                        )
+                        for pin_name, cat, subcat in pins:
+                            if pin_name in ("execute", "then", "self"):
+                                continue
+                            outputs.append({
+                                "name": _clean_name(pin_name),
+                                "type": _resolve_pin_type(cat, subcat or ""),
+                            })
 
                     graph_nodes = _parse_function_graph(t3d, graph)
                     body = _summarize_graph(graph_nodes)
                     functions.append({"name": graph, "inputs": inputs, "outputs": outputs, "body": body})
+
+            class_vars = class_vars_t3d | _collect_bpgc_hierarchy_variable_names(gen_class)
+            for v in variables:
+                if class_vars:
+                    v["scope"] = "component" if v["name"] in class_vars else "local"
+                else:
+                    v["scope"] = "component"
         except Exception as e:
             warnings.append({"code": "PARTIAL_PARSE", "message": str(e), "section": "functions"})
 
         for v in variables:
             if "scope" not in v:
                 v["scope"] = "component"
+
+        if not include_local_variables:
+            variables = [v for v in variables if v.get("scope") == "component"]
+        for v in variables:
+            v.pop("scope", None)
 
         # Interfaces
         interfaces = []
@@ -780,7 +866,8 @@ def handle_get_blueprint(blueprint_name: str) -> dict:
             "functions": functions,
             "warnings": warnings,
         }
-        _cache_set(path, result)
+        if not include_local_variables:
+            _cache_set(path, result)
         return result
     except Exception as e:
         return {
@@ -982,13 +1069,15 @@ def handle_asset_search(
         return {"error": True, "type": "RUNTIME", "code": "HANDLER_ERROR", "message": str(e), "tool": "asset_search"}
 
 
-def handle_get_variables(blueprint_name: str) -> dict:
+def handle_get_variables(blueprint_name: str, include_locals: bool = False) -> dict:
     """All variables on a Blueprint: name, type, default value, visibility flags."""
     try:
-        result = handle_get_blueprint(blueprint_name)
+        result = handle_get_blueprint(
+            blueprint_name, include_local_variables=include_locals
+        )
         if isinstance(result, dict) and result.get("error"):
             return result
-        return result.get("variables", [])
+        return {"variables": list(result.get("variables", []))}
     except Exception as e:
         return {
             "error": True,

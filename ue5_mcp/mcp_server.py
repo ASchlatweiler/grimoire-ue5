@@ -61,9 +61,12 @@ def list_components(blueprint_name: str) -> str:
 
 
 @mcp.tool()
-def get_variables(blueprint_name: str) -> str:
-    """All variables on a Blueprint: name, type, default value, visibility flags."""
-    return _call("get_variables", {"blueprint_name": blueprint_name})
+def get_variables(blueprint_name: str, include_locals: bool = False) -> str:
+    """All variables on a Blueprint: name, type, default value, visibility flags. Set include_locals=True to include function-scope locals."""
+    return _call("get_variables", {
+        "blueprint_name": blueprint_name,
+        "include_locals": include_locals,
+    })
 
 
 @mcp.tool()
