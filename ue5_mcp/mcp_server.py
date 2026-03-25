@@ -50,7 +50,7 @@ def list_blueprints(
 
 @mcp.tool()
 def get_blueprint(blueprint_name: str) -> str:
-    """Full inspection of a Blueprint: components, variables, functions, interfaces implemented."""
+    """Full inspection of a Blueprint: components, variables, functions. Note: interface list not available via API — use query_cache to find implementors by function name."""
     return _call("get_blueprint", {"blueprint_name": blueprint_name})
 
 
@@ -77,7 +77,7 @@ def list_interfaces() -> str:
 
 @mcp.tool()
 def get_interface(interface_name: str) -> str:
-    """Inspect a Blueprint Interface: function signatures, input/output pins."""
+    """Inspect a Blueprint Interface: function signatures, input/output pins. Returns full function contract."""
     return _call("get_interface", {"interface_name": interface_name})
 
 
@@ -118,7 +118,7 @@ def query_cache(
     output_type: str | None = None,
     type_name: str | None = None,
 ) -> str:
-    """Query the Grimoire SQLite cache. Set tool to 'query_blueprints', 'query_functions', or 'query_references'. query_blueprints: filter by parent_class, has_function, has_variable, references_type. query_functions: filter by name_filter, input_type, output_type. query_references: requires type_name."""
+    """Query the Grimoire SQLite cache. Set tool to 'query_blueprints', 'query_functions', or 'query_references'. query_blueprints: filter by parent_class, has_function, has_variable, references_type (matches variable/function pin types or implemented interface names). query_functions: filter by name_filter, input_type, output_type. query_references: requires type_name."""
     if tool == "query_blueprints":
         return _call("query_blueprints", {
             "parent_class": parent_class,

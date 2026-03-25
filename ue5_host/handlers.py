@@ -169,7 +169,7 @@ def handle_query_blueprints(
     has_variable: str | None = None,
     references_type: str | None = None,
 ) -> dict:
-    """Search cached blueprints by parent class, function name, variable name, or type reference."""
+    """Search cached blueprints by parent class, function name, variable name, type reference, or implemented interface name."""
     try:
         conn = _get_cache_db()
         rows = conn.execute(
@@ -205,7 +205,11 @@ def handle_query_blueprints(
                 for f in bp.get("functions", []):
                     for p in f.get("inputs", []) + f.get("outputs", []):
                         all_types.append(p.get("type", ""))
-                if not any(references_type.lower() in t.lower() for t in all_types):
+                iface_names = bp.get("interfaces") or []
+                ref_l = references_type.lower()
+                type_hit = any(ref_l in (t or "").lower() for t in all_types)
+                iface_hit = any(ref_l in (iface or "").lower() for iface in iface_names)
+                if not type_hit and not iface_hit:
                     continue
 
             results.append({
@@ -598,7 +602,7 @@ def _summarize_graph(nodes, t3d: str | None = None, graph_name: str | None = Non
 
 
 def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool = False) -> dict:
-    """Full inspection of a Blueprint: components, variables, functions, interfaces.
+    """Full inspection of a Blueprint: components, variables, functions (interfaces list empty; see warnings).
 
     When include_local_variables is True, skips cache read/write and returns all variables
     (component + local) after stripping scope. Default False: component variables only, cached.
@@ -656,6 +660,15 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
             pass
 
         warnings: list[dict] = []
+
+        # Interface implementation data is not accessible via UE5 Python API
+        # The 'interfaces' field will always be empty — use query_cache with
+        # has_function to infer interface implementors by shared function names
+        interfaces = []
+        warnings.append({
+            "code": "INTERFACE_DATA_UNAVAILABLE",
+            "message": "Interface implementation list not accessible via UE5 Python API. To find implementors of an interface, use query_cache(tool='query_blueprints', has_function='FunctionName') matching known interface function names.",
+        })
 
         # Components from SubobjectDataSubsystem
         components = []
@@ -787,6 +800,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
 
         # Functions from T3D export
         functions = []
+        blueprint_t3d = None
         try:
             import os
             import re as _re
@@ -807,6 +821,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
             if os.path.exists(t3d_path):
                 with open(t3d_path, "r") as f:
                     t3d = f.read()
+                blueprint_t3d = t3d
 
                 class_vars_t3d = _extract_class_variable_names(t3d)
 
@@ -923,13 +938,6 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
         for v in variables:
             v.pop("scope", None)
 
-        # Interfaces
-        interfaces = []
-        if hasattr(gen_class, "interfaces") and gen_class.interfaces:
-            for iface in gen_class.interfaces:
-                if iface and hasattr(iface, "get_name"):
-                    interfaces.append(iface.get_name())
-
         result = {
             "name": name,
             "path": path,
@@ -1006,55 +1014,8 @@ def handle_list_interfaces() -> dict:
 
 
 def handle_get_interface(interface_name: str) -> dict:
-    """Inspect a Blueprint Interface: function signatures, input/output pins."""
-    try:
-        ar = unreal.AssetRegistryHelpers.get_asset_registry()
-        if not ar:
-            return {"error": True, "type": "RUNTIME", "code": "ASSET_REGISTRY_UNAVAILABLE", "message": "Asset registry not available", "tool": "get_interface"}
-        assets = ar.get_assets_by_path("/Game", recursive=True)
-        if not assets:
-            assets = []
-        path = None
-        for ad in assets:
-            if not unreal.AssetRegistryHelpers.is_valid(ad):
-                continue
-            p = ad.to_soft_object_path().export_text()
-            if "." in p:
-                p = p.split(".")[0]
-            name = p.split("/")[-1] if "/" in p else p
-            if name == interface_name or (interface_name.startswith("/Game") and p == interface_name):
-                path = p
-                break
-        if not path:
-            return {"error": True, "type": "RUNTIME", "code": "ASSET_NOT_FOUND", "message": f"Interface not found: {interface_name}", "tool": "get_interface"}
-        obj = unreal.EditorAssetLibrary.load_asset(path)
-        if not obj:
-            return {"error": True, "type": "RUNTIME", "code": "LOAD_FAILED", "message": f"Failed to load: {path}", "tool": "get_interface"}
-        functions = []
-        if hasattr(obj, "functions") and obj.functions:
-            for f in obj.functions:
-                if not f:
-                    continue
-                fn_name = getattr(f, "get_name", lambda: "Unknown")()
-                inputs = []
-                outputs = []
-                if hasattr(f, "get_input_pins"):
-                    for pin in f.get_input_pins() or []:
-                        inputs.append({"name": getattr(pin, "pin_name", str(pin)), "type": str(getattr(pin, "pin_type", ""))})
-                elif hasattr(f, "inputs"):
-                    for pin in f.inputs or []:
-                        inputs.append({"name": str(getattr(pin, "pin_name", pin)), "type": "any"})
-                if hasattr(f, "get_output_pins"):
-                    for pin in f.get_output_pins() or []:
-                        outputs.append({"name": getattr(pin, "pin_name", str(pin)), "type": str(getattr(pin, "pin_type", ""))})
-                elif hasattr(f, "outputs"):
-                    for pin in f.outputs or []:
-                        outputs.append({"name": str(getattr(pin, "pin_name", pin)), "type": "any"})
-                functions.append({"name": str(fn_name), "inputs": inputs, "outputs": outputs})
-        name = path.split("/")[-1] if "/" in path else path
-        return {"name": name, "functions": functions}
-    except Exception as e:
-        return {"error": True, "type": "RUNTIME", "code": "HANDLER_ERROR", "message": str(e), "tool": "get_interface"}
+    """Inspect a Blueprint Interface — delegates to handle_get_blueprint since interfaces are Blueprint assets."""
+    return handle_get_blueprint(blueprint_name=interface_name)
 
 
 def handle_find_event_bindings(
