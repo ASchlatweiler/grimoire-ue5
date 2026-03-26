@@ -411,26 +411,39 @@ def _parse_function_graph(t3d, graph_name):
             continue
         # Only search for ref before CustomProperties pins start
         pre_pins = chunk[:chunk.find("CustomProperties Pin")] if "CustomProperties Pin" in chunk else chunk[:600]
-        ref_match = re.search(r'(?:Variable|Function)Reference=\([^)]*MemberName="([^"]+)"', pre_pins)
-        ref = ref_match.group(1) if ref_match else None
-        if ref is None and ("MakeStruct" in node_name or "BreakStruct" in node_name):
-            struct_match = re.search(
-                r'StructType="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'?"',
+        node_type = re.sub(r"_\d+$", "", node_name)
+
+        # Extract ref — MacroInstance first so MacroGraphReference wins over stray Var/Func refs in chunk
+        ref = None
+        if node_type == "K2Node_MacroInstance":
+            ref_m = re.search(
+                r'MacroGraphReference=\([^)]*MacroGraph="[^"]*:([^\']+)\'',
                 chunk,
             )
-            if not struct_match:
+            ref = ref_m.group(1).strip() if ref_m else None
+        else:
+            ref_match = re.search(
+                r'(?:Variable|Function)Reference=\([^)]*MemberName="([^"]+)"',
+                pre_pins,
+            )
+            ref = ref_match.group(1) if ref_match else None
+            if ref is None and ("MakeStruct" in node_name or "BreakStruct" in node_name):
                 struct_match = re.search(
-                    r'PinName="([A-Z][A-Za-z0-9_]+)"[^)]*Direction="EGPD_Output"',
+                    r'StructType="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'?"',
                     chunk,
                 )
-            if not struct_match:
-                struct_match = re.search(
-                    r'PinSubCategoryObject="[^"]*UserDefinedStruct\'[^\']*\.([^\']+)\'',
-                    chunk,
-                )
-            if struct_match:
-                ref = struct_match.group(1)
-        node_type = re.sub(r"_\d+$", "", node_name)
+                if not struct_match:
+                    struct_match = re.search(
+                        r'PinName="([A-Z][A-Za-z0-9_]+)"[^)]*Direction="EGPD_Output"',
+                        chunk,
+                    )
+                if not struct_match:
+                    struct_match = re.search(
+                        r'PinSubCategoryObject="[^"]*UserDefinedStruct\'[^\']*\.([^\']+)\'',
+                        chunk,
+                    )
+                if struct_match:
+                    ref = struct_match.group(1)
         if node_type == "K2Node_Select" and ref is None:
             ref = "select"
         if node_type == "K2Node_Self" and ref is None:
@@ -623,6 +636,8 @@ def _summarize_graph(
         elif ntype == "K2Node_AddDelegate":
             delegate_name = _clean_name(ref) if ref else ""
             steps.append(f"bind_delegate({delegate_name})" if delegate_name else "bind_delegate")
+        elif ntype == "K2Node_MacroInstance":
+            steps.append(f"macro:{_clean_name(ref)}" if ref else "macroinstance")
         else:
             steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
