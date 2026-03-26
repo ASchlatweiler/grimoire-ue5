@@ -435,6 +435,12 @@ def _parse_function_graph(t3d, graph_name):
             ref = "select"
         if node_type == "K2Node_Self" and ref is None:
             ref = "self"
+        if node_type == "K2Node_AddDelegate":
+            ref_m = re.search(r'DelegateReference=\([^)]*MemberName="([^"]+)"', chunk)
+            if ref_m:
+                ref = ref_m.group(1)
+            elif ref is None:
+                ref = "delegate"
         pin_starts = [m2.start() for m2 in re.finditer(r"CustomProperties Pin \(", chunk)]
         pins = []
         for i, start in enumerate(pin_starts):
@@ -614,6 +620,9 @@ def _summarize_graph(
                 steps.append(f"select ({idx_type}) [{opts_str}]")
             else:
                 steps.append(f"select ({idx_type})")
+        elif ntype == "K2Node_AddDelegate":
+            delegate_name = _clean_name(ref) if ref else ""
+            steps.append(f"bind_delegate({delegate_name})" if delegate_name else "bind_delegate")
         else:
             steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
