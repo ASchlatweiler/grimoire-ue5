@@ -477,6 +477,11 @@ def _clean_body(body: list[str]) -> list[str]:
     """Remove noise entries and clean up body step strings."""
     cleaned = []
     for step in body:
+        if step.strip() == "setvariableonpersistentframe":
+            continue
+        if step.strip() == "adddelegate":
+            cleaned.append("bind_delegate")
+            continue
         # Drop pure execution wire returns — no semantic content
         if step.startswith("return exec (exec)"):
             continue
@@ -502,12 +507,26 @@ def _clean_body(body: list[str]) -> list[str]:
     return cleaned
 
 
-def _summarize_graph(nodes, t3d: str | None = None, graph_name: str | None = None):
+def _summarize_graph(
+    nodes,
+    t3d: str | None = None,
+    graph_name: str | None = None,
+    entry_node_name: str | None = None,
+):
     by_name = {n: d for n, d in nodes.items()}
-    entry = next(
-        (n for n, d in by_name.items() if d["type"] == "K2Node_FunctionEntry"),
-        None,
-    )
+    entry = None
+    if entry_node_name and entry_node_name in by_name:
+        entry = entry_node_name
+    else:
+        entry = next(
+            (n for n, d in by_name.items() if d["type"] == "K2Node_FunctionEntry"),
+            None,
+        )
+        if not entry:
+            entry = next(
+                (n for n, d in by_name.items() if d["type"] == "K2Node_Event"),
+                None,
+            )
     if not entry:
         return []
     steps = []
@@ -521,6 +540,9 @@ def _summarize_graph(nodes, t3d: str | None = None, graph_name: str | None = Non
         ntype = node["type"]
         ref = node["ref"]
         if ntype == "K2Node_FunctionEntry":
+            pass
+        elif ntype == "K2Node_Event":
+            # Treat event nodes as graph roots; just walk their exec outputs.
             pass
         elif ntype == "K2Node_FunctionResult":
             inputs = [
@@ -829,14 +851,131 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                     r'Begin Object Class=/Script/Engine\.EdGraph Name="([^"]+)"',
                     t3d,
                 )
-                func_graphs = [g for g in all_graphs if g != "EventGraph"]
 
-                for graph in func_graphs:
-                    inputs = []
-                    try:
-                        entry_pattern = rf'K2Node_FunctionEntry_\d+" ExportPath="[^"]*:{_re.escape(graph)}\.'
-                        entry_matches = list(_re.finditer(entry_pattern, t3d))
-                        for em in entry_matches:
+                graph_candidates = [
+                    g for g in all_graphs if not g.startswith("ExecuteUbergraph_")
+                ]
+
+                for graph in graph_candidates:
+                    has_function_entry = bool(
+                        _re.search(
+                            rf'K2Node_FunctionEntry_\d+" ExportPath="[^"]*:{_re.escape(graph)}\.',
+                            t3d,
+                        )
+                    )
+                    has_event_entry = bool(
+                        _re.search(
+                            rf'K2Node_Event_\d+" ExportPath="[^"]*:{_re.escape(graph)}\.',
+                            t3d,
+                        )
+                    )
+
+                    # Regular function graphs (FunctionEntry -> FunctionResult)
+                    if has_function_entry:
+                        inputs = []
+                        try:
+                            entry_pattern = rf'K2Node_FunctionEntry_\d+" ExportPath="[^"]*:{_re.escape(graph)}\.'
+                            entry_matches = list(_re.finditer(entry_pattern, t3d))
+                            for em in entry_matches:
+                                epos = em.start()
+                                echunk = t3d[epos : epos + 4000]
+                                is_second = any(
+                                    k in echunk[:600]
+                                    for k in [
+                                        "CustomProperties",
+                                        "VariableReference=",
+                                        "FunctionReference=",
+                                        "ExtraFlags=",
+                                        "LocalVariables",
+                                        "NodePosX",
+                                        "NodePosY",
+                                        "bMadeA",
+                                    ]
+                                )
+                                if not is_second:
+                                    continue
+                                # Trim to just this node — stop at the next K2Node boundary
+                                next_boundaries = [
+                                    m.start()
+                                    for m in _re.finditer(r'K2Node_\w+_\d+" ExportPath=', echunk)
+                                ]
+                                if len(next_boundaries) > 1:
+                                    echunk = echunk[: next_boundaries[1]]
+                                # UserDefinedPin EGPD_Output on FunctionEntry = function input parameter
+                                input_pins = _re.findall(
+                                    r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Output',
+                                    echunk,
+                                )
+                                EXCLUDE_INPUT_NAMES = {"Object", "self", "execute", "then", "ReturnValue"}
+                                for pin_name, pin_cat, pin_subcat in input_pins:
+                                    if pin_name in EXCLUDE_INPUT_NAMES:
+                                        continue
+                                    type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
+                                    inputs.append({"name": _clean_name(pin_name), "type": type_str})
+                                if inputs or "UserDefinedPin" in echunk:
+                                    break
+                        except Exception:
+                            pass
+
+                        pattern = rf"K2Node_FunctionResult[^\n]*{_re.escape(name)}:{_re.escape(graph)}\."
+                        positions = [m.start() for m in _re.finditer(pattern, t3d)]
+                        if not positions:
+                            graph_nodes = _parse_function_graph(t3d, graph)
+                            body = _summarize_graph(graph_nodes, t3d, graph)
+                            functions.append(
+                                {"name": graph, "inputs": inputs, "outputs": [], "body": body}
+                            )
+                            continue
+
+                        rpos = positions[-1]
+                        chunk = t3d[rpos : rpos + 4000]
+                        next_boundaries = [
+                            m.start() for m in _re.finditer(r'K2Node_\w+_\d+" ExportPath=', chunk)
+                        ]
+                        if len(next_boundaries) > 1:
+                            chunk = chunk[: next_boundaries[1]]
+                        # UserDefinedPin EGPD_Input on FunctionResult = function output parameter
+                        output_pins = _re.findall(
+                            r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Input',
+                            chunk,
+                        )
+                        outputs = []
+                        for pin_name, pin_cat, pin_subcat in output_pins:
+                            if pin_name in ("execute", "then", "self"):
+                                continue
+                            type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
+                            outputs.append({"name": _clean_name(pin_name), "type": type_str})
+                        if not outputs:
+                            pins = _re.findall(
+                                r'PinName="([^"]+)".*?PinType\.PinCategory="([^"]+)"(?:.*?PinType\.PinSubCategoryObject="([^"]*)")?',
+                                chunk,
+                                _re.DOTALL,
+                            )
+                            for pin_name, cat, subcat in pins:
+                                if pin_name in ("execute", "then", "self"):
+                                    continue
+                                outputs.append({
+                                    "name": _clean_name(pin_name),
+                                    "type": _resolve_pin_type(cat, subcat or ""),
+                                })
+
+                        graph_nodes = _parse_function_graph(t3d, graph)
+                        body = _summarize_graph(graph_nodes, t3d, graph)
+                        functions.append(
+                            {"name": graph, "inputs": inputs, "outputs": outputs, "body": body}
+                        )
+
+                    # Event graphs (K2Node_Event -> exec chain)
+                    elif has_event_entry:
+                        graph_nodes = _parse_function_graph(t3d, graph)
+                        event_matches = list(
+                            _re.finditer(
+                                rf'(K2Node_Event_\d+)" ExportPath="[^"]*:{_re.escape(graph)}\.',
+                                t3d,
+                            )
+                        )
+                        for em in event_matches:
+                            event_node_name = em.group(1)
                             epos = em.start()
                             echunk = t3d[epos : epos + 4000]
                             is_second = any(
@@ -854,71 +993,37 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                             )
                             if not is_second:
                                 continue
-                            # Trim to just this node — stop at the next K2Node boundary
-                            next_boundaries = [
-                                m.start() for m in _re.finditer(r'K2Node_\w+_\d+" ExportPath=', echunk)
-                            ]
-                            if len(next_boundaries) > 1:
-                                echunk = echunk[: next_boundaries[1]]
-                            # UserDefinedPin EGPD_Output on FunctionEntry = function input parameter
-                            input_pins = _re.findall(
-                                r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Output',
+
+                            event_name_m = _re.search(r'MemberName="([^"]+)"', echunk)
+                            event_name = event_name_m.group(1) if event_name_m else event_node_name
+
+                            parent_m = _re.search(
+                                r'MemberParent="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'',
                                 echunk,
                             )
-                            EXCLUDE_INPUT_NAMES = {"Object", "self", "execute", "then", "ReturnValue"}
-                            for pin_name, pin_cat, pin_subcat in input_pins:
-                                if pin_name in EXCLUDE_INPUT_NAMES:
-                                    continue
-                                type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
-                                inputs.append({"name": _clean_name(pin_name), "type": type_str})
-                            if inputs or "UserDefinedPin" in echunk:
-                                break
-                    except Exception:
-                        pass
+                            event_parent = parent_m.group(1) if parent_m else parent_class
 
-                    pattern = rf"K2Node_FunctionResult[^\n]*{_re.escape(name)}:{_re.escape(graph)}\."
-                    positions = [m.start() for m in _re.finditer(pattern, t3d)]
-                    if not positions:
-                        graph_nodes = _parse_function_graph(t3d, graph)
-                        body = _summarize_graph(graph_nodes, t3d, graph)
-                        functions.append({"name": graph, "inputs": inputs, "outputs": [], "body": body})
-                        continue
+                            export_path_m = _re.search(r'ExportPath="([^"]+)"', echunk)
+                            export_path = export_path_m.group(1) if export_path_m else ""
 
-                    rpos = positions[-1]
-                    chunk = t3d[rpos : rpos + 4000]
-                    next_boundaries = [
-                        m.start() for m in _re.finditer(r'K2Node_\w+_\d+" ExportPath=', chunk)
-                    ]
-                    if len(next_boundaries) > 1:
-                        chunk = chunk[: next_boundaries[1]]
-                    # UserDefinedPin EGPD_Input on FunctionResult = function output parameter
-                    output_pins = _re.findall(
-                        r'UserDefinedPin \(PinName="([^"]+)",PinType=\(PinCategory="([^"]+)"(?:,PinSubCategoryObject="([^"]*)")?[^)]*\),DesiredPinDirection=EGPD_Input',
-                        chunk,
-                    )
-                    outputs = []
-                    for pin_name, pin_cat, pin_subcat in output_pins:
-                        if pin_name in ("execute", "then", "self"):
-                            continue
-                        type_str = _resolve_pin_type(pin_cat, pin_subcat or "")
-                        outputs.append({"name": _clean_name(pin_name), "type": type_str})
-                    if not outputs:
-                        pins = _re.findall(
-                            r'PinName="([^"]+)".*?PinType\.PinCategory="([^"]+)"(?:.*?PinType\.PinSubCategoryObject="([^"]*)")?',
-                            chunk,
-                            _re.DOTALL,
-                        )
-                        for pin_name, cat, subcat in pins:
-                            if pin_name in ("execute", "then", "self"):
-                                continue
-                            outputs.append({
-                                "name": _clean_name(pin_name),
-                                "type": _resolve_pin_type(cat, subcat or ""),
+                            graph_name_m = _re.search(r':([^.]+)\.K2Node_Event', export_path)
+                            graph_name = graph_name_m.group(1) if graph_name_m else graph
+
+                            body = _summarize_graph(
+                                graph_nodes,
+                                t3d,
+                                graph,
+                                entry_node_name=event_node_name,
+                            )
+                            functions.append({
+                                "name": graph_name,
+                                "kind": "event",
+                                "event": event_name,
+                                "parent": event_parent,
+                                "inputs": [],
+                                "outputs": [],
+                                "body": body,
                             })
-
-                    graph_nodes = _parse_function_graph(t3d, graph)
-                    body = _summarize_graph(graph_nodes, t3d, graph)
-                    functions.append({"name": graph, "inputs": inputs, "outputs": outputs, "body": body})
 
             class_vars = class_vars_t3d | _collect_bpgc_hierarchy_variable_names(gen_class)
             for v in variables:
@@ -937,6 +1042,18 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
             variables = [v for v in variables if v.get("scope") == "component"]
         for v in variables:
             v.pop("scope", None)
+
+        def _is_ubergraph_stub(func: dict) -> bool:
+            body = func.get("body", [])
+            if not body:
+                return False
+            return all(
+                step.startswith("call ExecuteUbergraph_")
+                or step == "setvariableonpersistentframe"
+                for step in body
+            )
+
+        functions = [f for f in functions if not _is_ubergraph_stub(f)]
 
         result = {
             "name": name,
