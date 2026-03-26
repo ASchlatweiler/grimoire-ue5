@@ -431,11 +431,16 @@ def _parse_function_graph(t3d, graph_name):
             if struct_match:
                 ref = struct_match.group(1)
         node_type = re.sub(r"_\d+$", "", node_name)
+        if node_type == "K2Node_Select" and ref is None:
+            ref = "select"
+        if node_type == "K2Node_Self" and ref is None:
+            ref = "self"
         pin_starts = [m2.start() for m2 in re.finditer(r"CustomProperties Pin \(", chunk)]
         pins = []
         for i, start in enumerate(pin_starts):
             end = pin_starts[i + 1] if i + 1 < len(pin_starts) else start + 1500
             pin_chunk = chunk[start:end]
+            pinid_m = re.search(r'PinId=([A-F0-9]{32})', pin_chunk)
             name_m = re.search(r'PinName="([^"]+)"', pin_chunk)
             cat_m = re.search(r'PinType\.PinCategory="([^"]+)"', pin_chunk)
             subcat_m = re.search(r'PinType\.PinSubCategoryObject="([^"]*)"', pin_chunk)
@@ -443,18 +448,20 @@ def _parse_function_graph(t3d, graph_name):
             linked_m = re.search(r'LinkedTo=\(([^)]+)\)', pin_chunk)
             if not name_m:
                 continue
-            linked_nodes = (
-                re.findall(r"(K2Node_\w+)\s+[A-F0-9]+", linked_m.group(1))
-                if linked_m
-                else []
-            )
+            linked_pairs = []
+            if linked_m:
+                linked_pairs = [
+                    {"node": ln, "pin": lp}
+                    for ln, lp in re.findall(r"(K2Node_\w+)\s+([A-F0-9]{32})", linked_m.group(1))
+                ]
             cat = cat_m.group(1) if cat_m else "unknown"
             subcat = subcat_m.group(1) if subcat_m else ""
             pins.append({
+                "pin_id": pinid_m.group(1) if pinid_m else "",
                 "name": name_m.group(1),
                 "type": _resolve_pin_type(cat, subcat) if cat_m else "unknown",
                 "direction": dir_m.group(1) if dir_m else "EGPD_Input",
-                "linked_to": linked_nodes,
+                "linked_to": linked_pairs,
             })
         node_data: dict = {"type": node_type, "ref": ref, "pins": pins}
         if node_type == "K2Node_Select":
@@ -471,6 +478,23 @@ def _parse_function_graph(t3d, graph_name):
                 )
         nodes[node_name] = node_data
     return nodes
+
+
+def _build_pin_lookup(t3d: str, graph_name: str) -> dict:
+    """Map output pin IDs to their source node ref for pure function resolution."""
+    pin_to_node: dict[str, str] = {}
+    try:
+        nodes = _parse_function_graph(t3d, graph_name)
+        for node_name, node in nodes.items():
+            ref = _clean_name(node.get("ref") or "")
+            ntype = node.get("type") or "unknown"
+            label = ref if ref else _clean_name(ntype.replace("K2Node_", "").lower())
+            for p in node.get("pins", []):
+                if p.get("direction") == "EGPD_Output" and p.get("pin_id"):
+                    pin_to_node[p["pin_id"]] = label
+    except Exception:
+        pass
+    return pin_to_node
 
 
 def _clean_body(body: list[str]) -> list[str]:
@@ -512,6 +536,7 @@ def _summarize_graph(
     t3d: str | None = None,
     graph_name: str | None = None,
     entry_node_name: str | None = None,
+    pin_to_node: dict | None = None,
 ):
     by_name = {n: d for n, d in nodes.items()}
     entry = None
@@ -552,19 +577,20 @@ def _summarize_graph(
                 and p["name"] not in ("execute", "self")
             ]
             for inp in inputs:
-                source = next(
-                    (
-                        p["linked_to"][0]
-                        for p in node["pins"]
-                        if p["name"] == inp["name"] and p["linked_to"]
-                    ),
+                pin_obj = next(
+                    (p for p in node["pins"] if p["name"] == inp["name"]),
                     None,
                 )
-                source_ref = (
-                    by_name[source]["ref"]
-                    if source and source in by_name
-                    else source
-                )
+                first_link = pin_obj["linked_to"][0] if pin_obj and pin_obj.get("linked_to") else None
+                source = first_link.get("node") if first_link else None
+                linked_pin = first_link.get("pin") if first_link else None
+                source_ref = None
+                if source and source in by_name:
+                    source_ref = by_name[source].get("ref") or source
+                else:
+                    source_ref = source
+                if (not source_ref or source_ref == "?") and pin_to_node and linked_pin:
+                    source_ref = pin_to_node.get(linked_pin, source_ref)
                 steps.append(
                     f"return {_clean_name(inp['name'])} ({inp['type']}) <- {_clean_name(source_ref) if source_ref else '?'}"
                 )
@@ -592,8 +618,10 @@ def _summarize_graph(
             steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
             if pin["type"] == "exec" and pin["direction"] == "EGPD_Output" and pin["linked_to"]:
-                for target in pin["linked_to"]:
-                    walk(target)
+                for link in pin["linked_to"]:
+                    target = link.get("node")
+                    if target:
+                        walk(target)
 
     walk(entry)
 
@@ -814,9 +842,83 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                         for v in obj.values():
                             walk(v, found)
 
-                found = set()
-                walk(data, found)
-                variables = [{"name": n, "type": t} for n, t in sorted(found)]
+                # Get NewVariables from stringify (different format than write_blueprint_class_to_temp_file)
+                import json
+
+                stringify_data = None
+                try:
+                    bp_obj2 = unreal.EditorAssetLibrary.load_asset(path)
+                    if bp_obj2:
+                        opts2 = unreal.JsonStringifyOptions()
+                        stringify_result = unreal.JsonObjectGraphFunctionLibrary.stringify(
+                            [bp_obj2], opts2
+                        )
+                        if stringify_result:
+                            stringify_data = json.loads(stringify_result)
+                        else:
+                            warnings.append({
+                                "code": "STRINGIFY_EMPTY",
+                                "message": "stringify returned empty result",
+                                "section": "NewVariables",
+                            })
+                    else:
+                        warnings.append({
+                            "code": "STRINGIFY_NO_ASSET",
+                            "message": f"Could not load asset at path: {path}",
+                            "section": "NewVariables",
+                        })
+                except Exception as e:
+                    warnings.append({
+                        "code": "STRINGIFY_FAIL",
+                        "message": str(e),
+                        "section": "NewVariables",
+                    })
+                    stringify_data = None
+
+                # Prefer authoritative NewVariables list when present
+                extracted = []
+                try:
+                    root = None
+                    roots = (
+                        stringify_data.get("__RootObjects")
+                        if isinstance(stringify_data, dict)
+                        else None
+                    )
+                    if isinstance(roots, list) and roots and isinstance(roots[0], dict):
+                        root = roots[0]
+                    new_vars = root.get("NewVariables") if isinstance(root, dict) else None
+                    if isinstance(new_vars, list) and new_vars:
+                        for var in new_vars:
+                            if not isinstance(var, dict):
+                                continue
+                            var_name = _clean_name(str(var.get("VarName", "") or ""))
+                            if (
+                                not var_name
+                                or any(var_name.startswith(p) for p in EXCLUDE_PREFIXES)
+                                or var_name in EXCLUDE_EXACT
+                            ):
+                                continue
+                            var_type_obj = var.get("VarType", {}) or {}
+                            pin_category = str(var_type_obj.get("PinCategory", "unknown") or "unknown")
+                            pin_subcat = str(var_type_obj.get("PinSubCategoryObject", "") or "")
+                            resolved_type = _resolve_pin_type(pin_category, pin_subcat)
+                            extracted.append({"name": var_name, "type": resolved_type})
+                    if not extracted and new_vars:
+                        warnings.append({
+                            "code": "VAR_EXTRACT_EMPTY",
+                            "message": f"NewVariables had {len(new_vars)} entries but extracted 0 — check EXCLUDE filters",
+                            "section": "NewVariables",
+                        })
+                except Exception as e:
+                    warnings.append({"code": "VAR_EXTRACT_FAIL", "message": str(e), "section": "NewVariables"})
+                    extracted = []
+
+                if extracted:
+                    variables = extracted
+                else:
+                    found = set()
+                    walk(data, found)
+                    variables = [{"name": n, "type": t} for n, t in sorted(found)]
         except Exception as e:
             warnings.append({"code": "PARTIAL_PARSE", "message": str(e), "section": "variables"})
 
@@ -921,7 +1023,8 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                         positions = [m.start() for m in _re.finditer(pattern, t3d)]
                         if not positions:
                             graph_nodes = _parse_function_graph(t3d, graph)
-                            body = _summarize_graph(graph_nodes, t3d, graph)
+                            pin_to_node = _build_pin_lookup(t3d, graph)
+                            body = _summarize_graph(graph_nodes, t3d, graph, pin_to_node=pin_to_node)
                             functions.append(
                                 {"name": graph, "inputs": inputs, "outputs": [], "body": body}
                             )
@@ -960,7 +1063,8 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                                 })
 
                         graph_nodes = _parse_function_graph(t3d, graph)
-                        body = _summarize_graph(graph_nodes, t3d, graph)
+                        pin_to_node = _build_pin_lookup(t3d, graph)
+                        body = _summarize_graph(graph_nodes, t3d, graph, pin_to_node=pin_to_node)
                         functions.append(
                             {"name": graph, "inputs": inputs, "outputs": outputs, "body": body}
                         )
@@ -968,6 +1072,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                     # Event graphs (K2Node_Event -> exec chain)
                     elif has_event_entry:
                         graph_nodes = _parse_function_graph(t3d, graph)
+                        pin_to_node = _build_pin_lookup(t3d, graph)
                         event_matches = list(
                             _re.finditer(
                                 rf'(K2Node_Event_\d+)" ExportPath="[^"]*:{_re.escape(graph)}\.',
@@ -1014,6 +1119,7 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                                 t3d,
                                 graph,
                                 entry_node_name=event_node_name,
+                                pin_to_node=pin_to_node,
                             )
                             functions.append({
                                 "name": graph_name,
@@ -1044,6 +1150,8 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
             v.pop("scope", None)
 
         def _is_ubergraph_stub(func: dict) -> bool:
+            if func.get("kind") == "event" and not func.get("body"):
+                return True
             body = func.get("body", [])
             if not body:
                 return False
