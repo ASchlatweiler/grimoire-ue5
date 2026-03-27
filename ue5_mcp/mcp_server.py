@@ -119,6 +119,12 @@ def get_struct(struct_name: str) -> str:
 
 
 @mcp.tool()
+def get_material(material_name: str) -> str:
+    """Inspect a Material or MaterialFunction: exposed parameters (scalar, vector, texture), output slot connections, and material function calls."""
+    return _call("get_material", {"material_name": material_name})
+
+
+@mcp.tool()
 def query_cache(
     tool: str,
     parent_class: str | None = None,

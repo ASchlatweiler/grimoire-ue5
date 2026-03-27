@@ -1573,6 +1573,194 @@ def handle_get_struct(struct_name: str) -> dict:
         }
 
 
+def handle_get_material(material_name: str) -> dict:
+    """Inspect a Material or MaterialFunction via T3D export: parameters, outputs, function calls."""
+    try:
+        import os
+        import tempfile
+
+        name_q = (material_name or "").strip()
+        if not name_q:
+            return {
+                "error": True,
+                "type": "VALIDATION",
+                "code": "INVALID_INPUT",
+                "message": "material_name is required",
+                "tool": "get_material",
+            }
+
+        ar = unreal.AssetRegistryHelpers.get_asset_registry()
+        if not ar:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "ASSET_REGISTRY_UNAVAILABLE",
+                "message": "Asset registry not available",
+                "tool": "get_material",
+            }
+
+        assets = ar.get_assets_by_path("/Game", recursive=True) or []
+        target_path = None
+        target_name = None
+        target_class = None
+        for ad in assets:
+            if not unreal.AssetRegistryHelpers.is_valid(ad):
+                continue
+            class_name = str(ad.asset_class_path.asset_name) if hasattr(ad, "asset_class_path") and ad.asset_class_path else ""
+            if class_name not in ("Material", "MaterialFunction"):
+                continue
+            path = ad.to_soft_object_path().export_text()
+            if "." in path:
+                path = path.split(".")[0]
+            asset_basename = path.split("/")[-1] if "/" in path else path
+            if name_q.lower() in asset_basename.lower():
+                target_path = path
+                target_name = asset_basename
+                target_class = class_name
+                break
+
+        if not target_path:
+            return {
+                "error": True,
+                "type": "NOT_FOUND",
+                "code": "MATERIAL_NOT_FOUND",
+                "message": f"No matching Material or MaterialFunction found for: {material_name}",
+                "tool": "get_material",
+            }
+
+        asset = unreal.EditorAssetLibrary.load_asset(target_path)
+        if not asset:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "LOAD_FAILED",
+                "message": f"Failed to load material asset: {target_path}",
+                "tool": "get_material",
+            }
+
+        tmp = tempfile.gettempdir().replace("\\", "/")
+        safe_stub = re.sub(r"[^\w\-]+", "_", target_name)[:80] or "material"
+        t3d_path = tmp + f"/{safe_stub}_mat.T3D"
+        task = unreal.AssetExportTask()
+        task.object = asset
+        task.filename = t3d_path
+        task.selected = False
+        task.replace_identical = True
+        task.prompt = False
+        task.automated = True
+        unreal.Exporter.run_asset_export_task(task)
+
+        if not os.path.exists(t3d_path):
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "EXPORT_FAILED",
+                "message": "T3D export did not produce a file",
+                "tool": "get_material",
+            }
+
+        try:
+            with open(t3d_path, "r", encoding="utf-8", errors="replace") as f:
+                t3d = f.read()
+        finally:
+            try:
+                os.unlink(t3d_path)
+            except OSError:
+                pass
+
+        outputs: dict = {}
+        editor_data_m = re.search(
+            r'Begin Object Name="\w+EditorOnlyData"(.*?)End Object',
+            t3d,
+            re.DOTALL,
+        )
+        if editor_data_m:
+            editor_chunk = editor_data_m.group(1)
+            for slot in (
+                "EmissiveColor",
+                "Opacity",
+                "BaseColor",
+                "Roughness",
+                "Metallic",
+                "Normal",
+                "WorldPositionOffset",
+            ):
+                slot_m = re.search(
+                    rf'{slot}=\(Expression="[^"]*\'[^:]+:(\w+)\'"\)',
+                    editor_chunk,
+                )
+                if slot_m:
+                    outputs[slot] = slot_m.group(1)
+
+        scalar_params = []
+        for m in re.finditer(r'Begin Object Name="(MaterialExpressionScalarParameter_\d+)"', t3d):
+            chunk = t3d[m.start() : m.start() + 600]
+            param_name_m = re.search(r'ParameterName="([^"]+)"', chunk)
+            default_m = re.search(r"DefaultValue=([0-9.\-]+)", chunk)
+            if param_name_m:
+                scalar_params.append({
+                    "name": param_name_m.group(1),
+                    "default": float(default_m.group(1)) if default_m else None,
+                })
+
+        vector_params = []
+        for m in re.finditer(r'Begin Object Name="(MaterialExpressionVectorParameter_\d+)"', t3d):
+            chunk = t3d[m.start() : m.start() + 600]
+            param_name_m = re.search(r'ParameterName="([^"]+)"', chunk)
+            default_m = re.search(r"DefaultValue=\(([^)]+)\)", chunk)
+            if param_name_m:
+                vector_params.append({
+                    "name": param_name_m.group(1),
+                    "default": default_m.group(1) if default_m else None,
+                })
+
+        texture_params = []
+        for m in re.finditer(
+            r'Begin Object Name="(MaterialExpressionTextureSampleParameter\w*_\d+)"',
+            t3d,
+        ):
+            chunk = t3d[m.start() : m.start() + 600]
+            param_name_m = re.search(r'ParameterName="([^"]+)"', chunk)
+            texture_m = re.search(r'Texture="/[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'', chunk)
+            if param_name_m:
+                texture_params.append({
+                    "name": param_name_m.group(1),
+                    "default_texture": texture_m.group(1) if texture_m else None,
+                })
+
+        function_calls = []
+        for m in re.finditer(
+            r'Begin Object Name="(MaterialExpressionMaterialFunctionCall_\d+)"',
+            t3d,
+        ):
+            chunk = t3d[m.start() : m.start() + 600]
+            func_m = re.search(
+                r'MaterialFunction="/[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'',
+                chunk,
+            )
+            if func_m and func_m.group(1) not in function_calls:
+                function_calls.append(func_m.group(1))
+
+        return {
+            "name": target_name,
+            "path": target_path,
+            "class": target_class,
+            "outputs": outputs,
+            "scalar_parameters": scalar_params,
+            "vector_parameters": vector_params,
+            "texture_parameters": texture_params,
+            "material_functions": function_calls,
+        }
+    except Exception as e:
+        return {
+            "error": True,
+            "type": "RUNTIME",
+            "code": "HANDLER_ERROR",
+            "message": str(e),
+            "tool": "get_material",
+        }
+
+
 def handle_get_variables(blueprint_name: str, include_locals: bool = False) -> dict:
     """All variables on a Blueprint: name, type, default value, visibility flags."""
     try:
