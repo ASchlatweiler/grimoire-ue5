@@ -107,6 +107,12 @@ def asset_search(
 
 
 @mcp.tool()
+def get_data_asset(asset_name: str) -> str:
+    """Read property values from a Blueprint Data Asset instance. Returns actual configured values (walk speeds, scalars, etc) not just schema."""
+    return _call("get_data_asset", {"asset_name": asset_name})
+
+
+@mcp.tool()
 def query_cache(
     tool: str,
     parent_class: str | None = None,

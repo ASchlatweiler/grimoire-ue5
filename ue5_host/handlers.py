@@ -93,11 +93,17 @@ def _get_cache_db():
             asset_path TEXT PRIMARY KEY,
             modified_time REAL,
             cached_at REAL,
-            result_json TEXT
+            result_json TEXT,
+            dirty INTEGER DEFAULT 0
         )
     """
     )
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE blueprint_cache ADD COLUMN dirty INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 
@@ -131,13 +137,15 @@ def _cache_get(asset_path: str):
     try:
         conn = _get_cache_db()
         row = conn.execute(
-            "SELECT modified_time, result_json FROM blueprint_cache WHERE asset_path = ?",
+            "SELECT dirty, modified_time, result_json FROM blueprint_cache WHERE asset_path = ?",
             (asset_path,),
         ).fetchone()
         conn.close()
         if not row:
             return None
-        cached_modified, result_json = row
+        dirty, cached_modified, result_json = row
+        if dirty:
+            return None
         current_modified = _get_asset_modified_time(asset_path)
         if current_modified <= cached_modified:
             return json.loads(result_json)
@@ -153,14 +161,29 @@ def _cache_set(asset_path: str, result: dict):
         modified_time = _get_asset_modified_time(asset_path)
         conn.execute(
             """INSERT OR REPLACE INTO blueprint_cache
-               (asset_path, modified_time, cached_at, result_json)
-               VALUES (?, ?, ?, ?)""",
+               (asset_path, modified_time, cached_at, result_json, dirty)
+               VALUES (?, ?, ?, ?, 0)""",
             (asset_path, modified_time, time.time(), json.dumps(result)),
         )
         conn.commit()
         conn.close()
     except Exception:
         pass
+
+
+def handle_mark_dirty(asset_path: str) -> dict:
+    """Mark a cache entry as dirty, forcing re-parse on next access."""
+    try:
+        conn = _get_cache_db()
+        conn.execute(
+            "UPDATE blueprint_cache SET dirty=1 WHERE asset_path=?",
+            (asset_path,),
+        )
+        conn.commit()
+        conn.close()
+        return {"marked_dirty": asset_path}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def handle_query_blueprints(
@@ -1351,6 +1374,103 @@ def handle_asset_search(
         return results
     except Exception as e:
         return {"error": True, "type": "RUNTIME", "code": "HANDLER_ERROR", "message": str(e), "tool": "asset_search"}
+
+
+def handle_get_data_asset(asset_name: str) -> dict:
+    """Read property values from a Blueprint Data Asset instance."""
+    try:
+        def _clean_value_keys(value):
+            if isinstance(value, dict):
+                cleaned = {}
+                for k, v in value.items():
+                    if k in {"__UObject", "NativeClass"}:
+                        continue
+                    key = _clean_name(str(k))
+                    cleaned[key] = _clean_value_keys(v)
+                return cleaned
+            if isinstance(value, list):
+                return [_clean_value_keys(v) for v in value]
+            return value
+
+        ar = unreal.AssetRegistryHelpers.get_asset_registry()
+        if not ar:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "ASSET_REGISTRY_UNAVAILABLE",
+                "message": "Asset registry not available",
+                "tool": "get_data_asset",
+            }
+
+        assets = ar.get_assets_by_path("/Game", recursive=True) or []
+        matches = []
+        for ad in assets:
+            if not unreal.AssetRegistryHelpers.is_valid(ad):
+                continue
+            path = ad.to_soft_object_path().export_text()
+            if "." in path:
+                path = path.split(".")[0]
+            name = path.split("/")[-1] if "/" in path else path
+            class_name = str(ad.asset_class_path.asset_name) if hasattr(ad, "asset_class_path") and ad.asset_class_path else "Object"
+            if asset_name.lower() in name.lower():
+                matches.append({"path": path, "name": name, "class": class_name})
+
+        expanded_matches = list(matches)
+        for match in matches:
+            if match.get("class") != "Blueprint":
+                continue
+            generated_class = f"{match['name']}_C"
+            for ad in assets:
+                if not unreal.AssetRegistryHelpers.is_valid(ad):
+                    continue
+                class_name = str(ad.asset_class_path.asset_name) if hasattr(ad, "asset_class_path") and ad.asset_class_path else "Object"
+                if class_name != generated_class:
+                    continue
+                path = ad.to_soft_object_path().export_text()
+                if "." in path:
+                    path = path.split(".")[0]
+                name = path.split("/")[-1] if "/" in path else path
+                expanded_matches.append({"path": path, "name": name, "class": class_name})
+
+        for match in expanded_matches:
+            class_name = match.get("class", "")
+            if not class_name.endswith("_C") or class_name == "Blueprint":
+                continue
+            path = match["path"]
+            obj = unreal.EditorAssetLibrary.load_asset(path)
+            if not obj:
+                continue
+            opts = unreal.JsonStringifyOptions()
+            result = unreal.JsonObjectGraphFunctionLibrary.stringify([obj], opts)
+            if not result:
+                continue
+            data = json.loads(result)
+            root = data.get("__RootObjects", [{}])[0] if isinstance(data, dict) else {}
+            if not isinstance(root, dict):
+                root = {}
+            properties = _clean_value_keys(root)
+            return {
+                "name": asset_name,
+                "path": path,
+                "class": class_name,
+                "properties": properties,
+            }
+
+        return {
+            "error": True,
+            "type": "NOT_FOUND",
+            "code": "DATA_ASSET_NOT_FOUND",
+            "message": f"No matching Data Asset instance found for: {asset_name}",
+            "tool": "get_data_asset",
+        }
+    except Exception as e:
+        return {
+            "error": True,
+            "type": "RUNTIME",
+            "code": "HANDLER_ERROR",
+            "message": str(e),
+            "tool": "get_data_asset",
+        }
 
 
 def handle_get_variables(blueprint_name: str, include_locals: bool = False) -> dict:

@@ -13,6 +13,7 @@ import json
 import os
 import socket
 import threading
+import time
 from queue import Empty, Queue
 
 # Unreal module — only available when running inside UE5 editor
@@ -31,6 +32,10 @@ DEFAULT_HOST = "127.0.0.1"
 # Request queue: (request_dict, result_holder, done_event)
 _pending_requests: "Queue[tuple]" = Queue()
 _tick_handle = None
+_cache_freshness_tick_handle = None
+
+_last_cache_check = [0.0]  # mutable container for closure
+CACHE_CHECK_INTERVAL = 15.0  # seconds
 
 
 def _run_handler(tool: str, params: dict) -> dict:
@@ -85,6 +90,10 @@ def _run_handler(tool: str, params: dict) -> dict:
             asset_class=params.get("asset_class"),
             name_filter=params.get("name_filter"),
         )
+    if tool == "get_data_asset":
+        from ue5_host.handlers import handle_get_data_asset
+
+        return handle_get_data_asset(asset_name=params.get("asset_name", ""))
     if tool == "query_blueprints":
         from ue5_host.handlers import handle_query_blueprints
 
@@ -143,6 +152,58 @@ def _tick_callback(delta_time: float) -> bool:
     """Slate tick callback — drain pending requests. Returns True to keep receiving ticks."""
     _process_request_queue()
     return True
+
+
+def _check_cache_freshness(delta_time: float) -> bool:
+    """Periodic tick: scan for modified .uasset files and mark dirty cache entries."""
+    now = time.time()
+    if now - _last_cache_check[0] < CACHE_CHECK_INTERVAL:
+        return True
+    _last_cache_check[0] = now
+    if unreal is None:
+        return True
+    try:
+        from ue5_host.handlers import _get_asset_modified_time, _get_cache_db
+
+        conn = _get_cache_db()
+        rows = conn.execute(
+            "SELECT asset_path, modified_time FROM blueprint_cache WHERE dirty=0"
+        ).fetchall()
+        dirty_paths = []
+        for asset_path, cached_modified in rows:
+            current = _get_asset_modified_time(asset_path)
+            if current > cached_modified:
+                dirty_paths.append(asset_path)
+        if dirty_paths:
+            for path in dirty_paths:
+                conn.execute(
+                    "UPDATE blueprint_cache SET dirty=1 WHERE asset_path=?",
+                    (path,),
+                )
+            conn.commit()
+            if hasattr(unreal, "log"):
+                unreal.log(f"[Grimoire] Marked {len(dirty_paths)} cache entries dirty")
+        conn.close()
+    except Exception as e:
+        if hasattr(unreal, "log_warning"):
+            unreal.log_warning(f"[Grimoire] Cache check error: {e}")
+    return True
+
+
+def _register_cache_freshness_watcher():
+    """After IPC bridge is up: poll disk mtimes vs SQLite and mark stale rows dirty."""
+    global _cache_freshness_tick_handle
+    if unreal is None or not hasattr(unreal, "register_slate_post_tick_callback"):
+        return
+    if _cache_freshness_tick_handle is not None:
+        return
+    try:
+        _cache_freshness_tick_handle = unreal.register_slate_post_tick_callback(_check_cache_freshness)
+        if hasattr(unreal, "log"):
+            unreal.log(f"[Grimoire] Cache freshness watcher registered ({CACHE_CHECK_INTERVAL:g}s interval)")
+    except Exception as e:
+        if hasattr(unreal, "log_warning"):
+            unreal.log_warning(f"[Grimoire] Cache freshness watcher registration failed: {e}")
 
 
 def _schedule_on_game_thread(request_dict: dict, result_holder: list, done_event: threading.Event):
@@ -254,6 +315,58 @@ def _run_server(host: str, port: int):
         server.close()
 
 
+def _register_grimoire_cache_dirty_hook():
+    """On asset save, mark SQLite cache row dirty so next get_blueprint re-parses."""
+    if unreal is None:
+        return
+    try:
+        from ue5_host.handlers import handle_mark_dirty
+
+        def _on_asset_post_save(asset, *args, **kwargs):
+            if asset is None:
+                return
+            try:
+                path = str(asset.get_path_name())
+                if "." in path:
+                    path = path.split(".")[0]
+                handle_mark_dirty(path)
+                if hasattr(unreal, "log"):
+                    unreal.log(f"[Grimoire] Marked dirty: {path}")
+            except Exception as e:
+                if hasattr(unreal, "log_warning"):
+                    unreal.log_warning(f"[Grimoire] post-save hook error: {e}")
+
+        bound = False
+        if hasattr(unreal, "EditorDelegates"):
+            ed = unreal.EditorDelegates
+            for attr in (
+                "on_asset_post_save",
+                "on_asset_saved",
+                "on_asset_post_save_with_context",
+            ):
+                if not hasattr(ed, attr):
+                    continue
+                d = getattr(ed, attr)
+                for meth in ("add_callable", "add", "bind_callable", "add_dynamic"):
+                    if hasattr(d, meth):
+                        try:
+                            getattr(d, meth)(_on_asset_post_save)
+                            bound = True
+                            break
+                        except Exception:
+                            continue
+                if bound:
+                    break
+        if not bound and hasattr(unreal, "log_warning"):
+            unreal.log_warning(
+                "[Grimoire] Asset post-save delegate not available; "
+                "stale cache rows are still marked dirty by the periodic freshness watcher.",
+            )
+    except Exception as e:
+        if hasattr(unreal, "log_warning"):
+            unreal.log_warning(f"[Grimoire] Cache dirty hook registration failed: {e}")
+
+
 def start_host(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     """Start the UE5 host. Call from game thread (e.g. at editor startup)."""
     global _tick_handle
@@ -262,6 +375,8 @@ def start_host(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     if unreal is not None and _tick_handle is None and hasattr(unreal, "register_slate_post_tick_callback"):
         _tick_handle = unreal.register_slate_post_tick_callback(_tick_callback)
 
+    _register_grimoire_cache_dirty_hook()
+
     server_thread = threading.Thread(
         target=_run_server,
         args=(host, port),
@@ -269,6 +384,8 @@ def start_host(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
         name="UE5ContextBridge",
     )
     server_thread.start()
+
+    _register_cache_freshness_watcher()
 
 
 # Auto-start when loaded in UE5 editor (e.g. via Python Startup Scripts)
