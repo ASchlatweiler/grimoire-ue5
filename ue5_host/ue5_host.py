@@ -94,6 +94,10 @@ def _run_handler(tool: str, params: dict) -> dict:
         from ue5_host.handlers import handle_get_data_asset
 
         return handle_get_data_asset(asset_name=params.get("asset_name", ""))
+    if tool == "get_struct":
+        from ue5_host.handlers import handle_get_struct
+
+        return handle_get_struct(struct_name=params.get("struct_name", ""))
     if tool == "query_blueprints":
         from ue5_host.handlers import handle_query_blueprints
 

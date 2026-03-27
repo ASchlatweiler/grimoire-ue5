@@ -1473,6 +1473,106 @@ def handle_get_data_asset(asset_name: str) -> dict:
         }
 
 
+def handle_get_struct(struct_name: str) -> dict:
+    """Inspect a UserDefinedStruct asset and return field names/types."""
+    try:
+        ar = unreal.AssetRegistryHelpers.get_asset_registry()
+        if not ar:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "ASSET_REGISTRY_UNAVAILABLE",
+                "message": "Asset registry not available",
+                "tool": "get_struct",
+            }
+
+        assets = ar.get_assets_by_path("/Game", recursive=True) or []
+        target_path = None
+        target_name = None
+        for ad in assets:
+            if not unreal.AssetRegistryHelpers.is_valid(ad):
+                continue
+            class_name = str(ad.asset_class_path.asset_name) if hasattr(ad, "asset_class_path") and ad.asset_class_path else ""
+            if class_name != "UserDefinedStruct":
+                continue
+            path = ad.to_soft_object_path().export_text()
+            if "." in path:
+                path = path.split(".")[0]
+            name = path.split("/")[-1] if "/" in path else path
+            if struct_name.lower() in name.lower():
+                target_path = path
+                target_name = name
+                break
+
+        if not target_path:
+            return {
+                "error": True,
+                "type": "NOT_FOUND",
+                "code": "STRUCT_NOT_FOUND",
+                "message": f"No matching UserDefinedStruct found for: {struct_name}",
+                "tool": "get_struct",
+            }
+
+        obj = unreal.EditorAssetLibrary.load_asset(target_path)
+        if not obj:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "LOAD_FAILED",
+                "message": f"Failed to load struct asset: {target_path}",
+                "tool": "get_struct",
+            }
+
+        opts = unreal.JsonStringifyOptions()
+        result = unreal.JsonObjectGraphFunctionLibrary.stringify([obj], opts)
+        if not result:
+            return {
+                "error": True,
+                "type": "RUNTIME",
+                "code": "STRINGIFY_EMPTY",
+                "message": "Json stringify returned empty result",
+                "tool": "get_struct",
+            }
+
+        data = json.loads(result)
+        root = data.get("__RootObjects", [{}])[0] if isinstance(data, dict) else {}
+        if not isinstance(root, dict):
+            root = {}
+        editor_data = root.get("EditorData", {})
+        if not isinstance(editor_data, dict):
+            editor_data = {}
+        var_descs = editor_data.get("VariablesDescriptions", [])
+        if not isinstance(var_descs, list):
+            var_descs = []
+
+        fields = []
+        for var in var_descs:
+            if not isinstance(var, dict):
+                continue
+            friendly_name = var.get("FriendlyName") or _clean_name(str(var.get("VarName", "") or ""))
+            category = var.get("Category", "unknown")
+            subcat = var.get("SubCategoryObject", "") or ""
+            resolved_type = _resolve_pin_type(str(category), str(subcat))
+            fields.append({
+                "name": friendly_name,
+                "type": resolved_type,
+            })
+
+        return {
+            "name": target_name,
+            "path": target_path,
+            "fields": fields,
+        }
+    except Exception as e:
+        return {
+            "error": True,
+            "type": "RUNTIME",
+            "code": "HANDLER_ERROR",
+            "message": str(e),
+            "tool": "get_struct",
+        }
+
+
 def handle_get_variables(blueprint_name: str, include_locals: bool = False) -> dict:
     """All variables on a Blueprint: name, type, default value, visibility flags."""
     try:

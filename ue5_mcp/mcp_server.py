@@ -113,6 +113,12 @@ def get_data_asset(asset_name: str) -> str:
 
 
 @mcp.tool()
+def get_struct(struct_name: str) -> str:
+    """Inspect a UserDefinedStruct: field names and types."""
+    return _call("get_struct", {"struct_name": struct_name})
+
+
+@mcp.tool()
 def query_cache(
     tool: str,
     parent_class: str | None = None,
