@@ -608,7 +608,7 @@ def _summarize_graph(
         ref = node["ref"]
         if ntype == "K2Node_FunctionEntry":
             pass
-        elif ntype == "K2Node_Event":
+        elif ntype in ("K2Node_Event", "K2Node_CustomEvent"):
             # Treat event nodes as graph roots; just walk their exec outputs.
             pass
         elif ntype == "K2Node_FunctionResult":
@@ -1018,6 +1018,12 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                             t3d,
                         )
                     )
+                    has_custom_event_entry = bool(
+                        _re.search(
+                            rf'K2Node_CustomEvent_\d+" ExportPath="[^"]*:{_re.escape(graph)}\.',
+                            t3d,
+                        )
+                    )
 
                     # Regular function graphs (FunctionEntry -> FunctionResult)
                     if has_function_entry:
@@ -1117,48 +1123,47 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                         )
 
                     # Event graphs (K2Node_Event -> exec chain)
-                    elif has_event_entry:
+                    elif has_event_entry or has_custom_event_entry:
                         graph_nodes = _parse_function_graph(t3d, graph)
                         pin_to_node = _build_pin_lookup(t3d, graph)
-                        event_matches = list(
-                            _re.finditer(
-                                rf'(K2Node_Event_\d+)" ExportPath="[^"]*:{_re.escape(graph)}\.',
-                                t3d,
-                            )
-                        )
-                        for em in event_matches:
+                        graph_events = []
+                        event_starts = []
+                        event_pattern = rf'(K2Node_Event_\d+)" ExportPath="[^"]*:{_re.escape(graph)}\.'
+                        for em in _re.finditer(event_pattern, t3d):
+                            event_starts.append(("event", em))
+                        custom_pattern = rf'(K2Node_CustomEvent_\d+)" ExportPath="[^"]*:{_re.escape(graph)}\.'
+                        for cm in _re.finditer(custom_pattern, t3d):
+                            event_starts.append(("custom", cm))
+                        event_starts.sort(key=lambda item: item[1].start())
+
+                        for event_kind, em in event_starts:
                             event_node_name = em.group(1)
                             epos = em.start()
                             echunk = t3d[epos : epos + 4000]
-                            is_second = any(
-                                k in echunk[:600]
-                                for k in [
-                                    "CustomProperties",
-                                    "VariableReference=",
-                                    "FunctionReference=",
-                                    "ExtraFlags=",
-                                    "LocalVariables",
-                                    "NodePosX",
-                                    "NodePosY",
-                                    "bMadeA",
-                                ]
-                            )
-                            if not is_second:
+                            if "NodePosX" not in echunk[:600]:
+                                continue
+                            enabled_m = _re.search(r"EnabledState=(\w+)", echunk)
+                            if enabled_m and enabled_m.group(1) == "Disabled":
                                 continue
 
-                            event_name_m = _re.search(r'MemberName="([^"]+)"', echunk)
-                            event_name = event_name_m.group(1) if event_name_m else event_node_name
-
-                            parent_m = _re.search(
-                                r'MemberParent="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'',
-                                echunk,
-                            )
-                            event_parent = parent_m.group(1) if parent_m else parent_class
+                            if event_kind == "custom":
+                                name_m = _re.search(r'CustomFunctionName="([^"]+)"', echunk)
+                                if not name_m:
+                                    continue
+                                event_name = name_m.group(1)
+                                event_parent = "custom"
+                            else:
+                                event_name_m = _re.search(r'MemberName="([^"]+)"', echunk)
+                                event_name = event_name_m.group(1) if event_name_m else event_node_name
+                                parent_m = _re.search(
+                                    r'MemberParent="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'',
+                                    echunk,
+                                )
+                                event_parent = parent_m.group(1) if parent_m else parent_class
 
                             export_path_m = _re.search(r'ExportPath="([^"]+)"', echunk)
                             export_path = export_path_m.group(1) if export_path_m else ""
-
-                            graph_name_m = _re.search(r':([^.]+)\.K2Node_Event', export_path)
+                            graph_name_m = _re.search(r':([^.]+)\.K2Node_(?:Event|CustomEvent)', export_path)
                             graph_name = graph_name_m.group(1) if graph_name_m else graph
 
                             body = _summarize_graph(
@@ -1168,7 +1173,9 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                                 entry_node_name=event_node_name,
                                 pin_to_node=pin_to_node,
                             )
-                            functions.append({
+                            if not body:
+                                body = ["[exec chain not traceable — macro or custom node has no LinkedTo in T3D export]"]
+                            graph_events.append({
                                 "name": graph_name,
                                 "kind": "event",
                                 "event": event_name,
@@ -1177,6 +1184,59 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                                 "outputs": [],
                                 "body": body,
                             })
+                        # Second pass: surface any enabled events not captured by the exec walker.
+                        already_captured = {e.get("event") for e in graph_events}
+                        fallback_body = ["[exec chain not traceable — no LinkedTo on exec pins in T3D export]"]
+
+                        for em in _re.finditer(event_pattern, t3d):
+                            echunk = t3d[em.start() : em.start() + 400]
+                            if "NodePosX" not in echunk:
+                                continue
+                            enabled_m = _re.search(r"EnabledState=(\w+)", echunk)
+                            if enabled_m and enabled_m.group(1) == "Disabled":
+                                continue
+                            member_m = _re.search(r'MemberName="([^"]+)"', echunk)
+                            event_name = member_m.group(1) if member_m else None
+                            if not event_name or event_name in already_captured:
+                                continue
+                            parent_m = _re.search(
+                                r'MemberParent="[^"]*[/\.]([A-Za-z_][A-Za-z0-9_]+)\'',
+                                echunk,
+                            )
+                            graph_events.append({
+                                "name": graph,
+                                "kind": "event",
+                                "event": event_name,
+                                "parent": parent_m.group(1) if parent_m else "unknown",
+                                "inputs": [],
+                                "outputs": [],
+                                "body": fallback_body,
+                            })
+                            already_captured.add(event_name)
+
+                        for cm in _re.finditer(custom_pattern, t3d):
+                            cchunk = t3d[cm.start() : cm.start() + 400]
+                            if "NodePosX" not in cchunk:
+                                continue
+                            enabled_m = _re.search(r"EnabledState=(\w+)", cchunk)
+                            if enabled_m and enabled_m.group(1) == "Disabled":
+                                continue
+                            member_m = _re.search(r'CustomFunctionName="([^"]+)"', cchunk)
+                            event_name = member_m.group(1) if member_m else None
+                            if not event_name or event_name in already_captured:
+                                continue
+                            graph_events.append({
+                                "name": graph,
+                                "kind": "event",
+                                "event": event_name,
+                                "parent": "custom",
+                                "inputs": [],
+                                "outputs": [],
+                                "body": fallback_body,
+                            })
+                            already_captured.add(event_name)
+
+                        functions.extend(graph_events)
 
             class_vars = class_vars_t3d | _collect_bpgc_hierarchy_variable_names(gen_class)
             for v in variables:
@@ -1197,8 +1257,9 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
             v.pop("scope", None)
 
         def _is_ubergraph_stub(func: dict) -> bool:
-            if func.get("kind") == "event" and not func.get("body"):
-                return True
+            # Never filter event functions — they are real events.
+            if func.get("kind") == "event":
+                return False
             body = func.get("body", [])
             if not body:
                 return False
@@ -1208,7 +1269,12 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                 for step in body
             )
 
-        functions = [f for f in functions if not _is_ubergraph_stub(f)]
+        filtered_functions = []
+        for func in functions:
+            if _is_ubergraph_stub(func):
+                continue
+            filtered_functions.append(func)
+        functions = filtered_functions
 
         result = {
             "name": name,
