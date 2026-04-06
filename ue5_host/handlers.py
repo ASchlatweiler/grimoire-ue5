@@ -417,7 +417,7 @@ def _parse_function_graph(t3d, graph_name):
     for m in matches:
         pos = m.start()
         node_name = m.group(1)
-        chunk = t3d[pos : pos + 5000]
+        chunk = t3d[pos : pos + 12000]  # large K2Node_FunctionEntry may include many LocalVariables
         # Second-pass nodes have either VariableReference, FunctionReference, or CustomProperties
         # within the first 600 chars. First-pass nodes have none of these.
         is_second_pass = (
@@ -624,13 +624,17 @@ def _summarize_graph(
                     None,
                 )
                 first_link = pin_obj["linked_to"][0] if pin_obj and pin_obj.get("linked_to") else None
-                source = first_link.get("node") if first_link else None
-                linked_pin = first_link.get("pin") if first_link else None
+                source_node = (
+                    first_link["node"]
+                    if isinstance(first_link, dict)
+                    else first_link
+                )
+                linked_pin = first_link.get("pin") if isinstance(first_link, dict) else None
                 source_ref = None
-                if source and source in by_name:
-                    source_ref = by_name[source].get("ref") or source
+                if source_node and source_node in by_name:
+                    source_ref = by_name[source_node].get("ref") or source_node
                 else:
-                    source_ref = source
+                    source_ref = source_node
                 if (not source_ref or source_ref == "?") and pin_to_node and linked_pin:
                     source_ref = pin_to_node.get(linked_pin, source_ref)
                 steps.append(
@@ -664,11 +668,16 @@ def _summarize_graph(
         else:
             steps.append(f"{_clean_name(ntype.replace('K2Node_', '').lower())} {_clean_name(ref) if ref else ''}")
         for pin in node["pins"]:
-            if pin["type"] == "exec" and pin["direction"] == "EGPD_Output" and pin["linked_to"]:
+            is_exec_out = (
+                pin["type"] == "exec" and pin["direction"] == "EGPD_Output"
+            ) or (
+                pin["name"] == "then" and pin.get("linked_to")
+            )
+            if is_exec_out and pin.get("linked_to"):
                 for link in pin["linked_to"]:
-                    target = link.get("node")
-                    if target:
-                        walk(target)
+                    target_node = link["node"] if isinstance(link, dict) else link
+                    if target_node:
+                        walk(target_node)
 
     walk(entry)
 
@@ -1275,6 +1284,20 @@ def handle_get_blueprint(blueprint_name: str, *, include_local_variables: bool =
                 continue
             filtered_functions.append(func)
         functions = filtered_functions
+
+        # Warn if any event bodies are untraceable in exported T3D.
+        untraceable = [
+            f.get("event") for f in functions
+            if f.get("kind") == "event" and (
+                not f.get("body")
+                or any("not traceable" in s for s in f.get("body", []))
+            )
+        ]
+        if untraceable:
+            warnings.append({
+                "code": "EVENTGRAPH_PARTIAL",
+                "message": f"EventGraph exec chains not fully traceable for: {', '.join(untraceable)}. UE5 T3D export does not serialize exec pin LinkedTo data for macro/custom event nodes. Actual body may differ from what is shown.",
+            })
 
         result = {
             "name": name,
