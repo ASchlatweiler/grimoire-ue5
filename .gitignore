@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 config.toml
-"config copy.toml"
+config copy.toml
 .env
+*.db
+*.db-journal
+Saved/

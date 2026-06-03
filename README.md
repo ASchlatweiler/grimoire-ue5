@@ -43,21 +43,15 @@ pip install -r requirements.txt
 
 ### 2. Configure the project
 
-Edit `config.toml`:
+Copy the example config and set your UE5 project path (the folder containing your `.uproject` file):
 
-```toml
-[project]
-name = "Grimoire"
-root = "C:/path/to/your/ue5-project"
-
-[ipc]
-host = "127.0.0.1"
-port = 65432
-timeout_sec = 5
-
-[server]
-log_level = "info"
+```bash
+cp config.toml.example config.toml
 ```
+
+On Windows (PowerShell): `Copy-Item config.toml.example config.toml`
+
+Edit `config.toml` and set `root` under `[project]`. `config.toml` is gitignored — keep your real paths local only. See `config.toml.example` for all available keys.
 
 ### 3. Install the Unreal Host
 
@@ -66,7 +60,19 @@ The editor must be able to import `ue5_host` on its Python path. Two common appr
 - **Copy** — Copy the entire `ue5_host` folder into your project (e.g. paste it at `YourProject/Content/Python/ue5_host/`). No symlink required; this is the simplest option on Windows.
 - **Symlink** — Point `Content/Python/ue5_host` at a single checkout elsewhere if you prefer not to duplicate files.
 
-Either way, the layout should be `.../ue5_host/ue5_host.py` plus the rest of the package next to it. You can also skip both and pass a **full absolute path** to the startup script (see step 4).
+Target layout inside your UE5 project:
+
+```
+YourProject/
+└── Content/
+    └── Python/
+        └── ue5_host/
+            ├── ue5_host.py
+            ├── handlers.py
+            └── __init__.py
+```
+
+You can also skip copy/symlink and pass a **full absolute path** to the startup script instead (see step 4).
 
 ### 4. Enable the Host in UE5
 
@@ -235,3 +241,11 @@ Requires the **Json Blueprint Utilities** plugin (built-in, free).
 - Branch-aware body format — pending Epic Python API exposure of exec pin connections
 - Multi-project switching without config changes
 - `grimoire_setup.py` — automated install and config generation
+
+---
+
+## License & contributing
+
+Grimoire is dual-licensed. **AGPL-3.0** applies by default; see [LICENSE](./LICENSE) for the full text and [DUAL_LICENSE.md](./DUAL_LICENSE.md) for commercial licensing.
+
+Contributions, issues, and PR expectations: [CONTRIBUTING.md](./CONTRIBUTING.md).
